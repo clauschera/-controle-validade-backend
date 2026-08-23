@@ -3,7 +3,12 @@ const fs = require('fs');
 const path = require('path');
 const express = require('express');
 const cors = require('cors');
-const { Pool } = require('pg');
+const { Pool, types } = require('pg');
+
+// Faz o driver do Postgres devolver colunas do tipo DATE como texto puro (ex: "2026-08-30"),
+// em vez de converter para um objeto Date com fuso horário (o que gerava datas erradas
+// e "NaN dias restantes" no aplicativo).
+types.setTypeParser(1082, (val) => val);
 
 const app = express();
 app.use(cors());
