@@ -128,6 +128,42 @@ app.delete('/api/:store/products/:codigo', requireApiKey, requireStore, async (r
   res.json({ ok: true });
 });
 
+// Edita um produto existente — permite trocar código, descrição, marca e estoque.
+// Se o código mudar, os lotes já cadastrados para o código antigo são movidos junto.
+app.put('/api/:store/products/:codigo', requireApiKey, requireStore, async (req, res) => {
+  const store = req.params.store;
+  const codigoAtual = req.params.codigo;
+  const { codigo: novoCodigo, descricao, marca, estoque } = req.body;
+  if (!novoCodigo || !descricao) return res.status(400).json({ error: 'codigo e descricao são obrigatórios.' });
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    if (novoCodigo !== codigoAtual) {
+      const { rowCount } = await client.query('SELECT 1 FROM products WHERE store=$1 AND codigo=$2', [store, novoCodigo]);
+      if (rowCount > 0) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ error: 'Já existe um produto com esse código.' });
+      }
+    }
+    await client.query(
+      `UPDATE products SET codigo=$1, descricao=$2, marca=$3, estoque=$4, updated_at=now() WHERE store=$5 AND codigo=$6`,
+      [novoCodigo, descricao, marca || null, estoque ?? null, store, codigoAtual]
+    );
+    if (novoCodigo !== codigoAtual) {
+      await client.query('UPDATE lotes SET codigo=$1 WHERE store=$2 AND codigo=$3', [novoCodigo, store, codigoAtual]);
+    }
+    await client.query('COMMIT');
+    res.json({ ok: true });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error(err);
+    res.status(500).json({ error: 'Falha ao editar produto.' });
+  } finally {
+    client.release();
+  }
+});
+
 // --- Lotes / validades --------------------------------------------------------
 
 app.get('/api/:store/lotes', requireApiKey, requireStore, async (req, res) => {
