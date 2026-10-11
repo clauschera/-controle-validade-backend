@@ -19,9 +19,35 @@ const pool = new Pool({
   ssl: process.env.DATABASE_URL && process.env.DATABASE_URL.includes('localhost') ? false : { rejectUnauthorized: false },
 });
 
+// Tabelas do módulo "Depósito Agromania" (itens da Vila Valentim guardados no depósito da Agromania).
+// Ficam aqui no próprio server.js para que basta atualizar este arquivo no GitHub.
+const SQL_DEPOSITO = `
+CREATE TABLE IF NOT EXISTS deposito_itens (
+  id SERIAL PRIMARY KEY,
+  store TEXT NOT NULL,               -- dona do item (hoje: 'vilavalentim')
+  codigo TEXT,                       -- código do produto no catálogo, quando houver
+  descricao TEXT NOT NULL,
+  categoria TEXT NOT NULL DEFAULT 'Produto',  -- Produto, Cesta, Embalagem, Outro
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_deposito_itens_desc ON deposito_itens(store, lower(descricao));
+
+CREATE TABLE IF NOT EXISTS deposito_movs (
+  id SERIAL PRIMARY KEY,
+  item_id INTEGER NOT NULL REFERENCES deposito_itens(id) ON DELETE CASCADE,
+  tipo TEXT NOT NULL CHECK (tipo IN ('entrada','saida')),  -- entrada = levado ao depósito; saida = retornou à loja
+  quantidade INTEGER NOT NULL CHECK (quantidade > 0),
+  usuario TEXT,
+  obs TEXT,
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_deposito_movs_item ON deposito_movs(item_id);
+`;
+
 async function garantirTabelas() {
   const sql = fs.readFileSync(path.join(__dirname, 'schema.sql'), 'utf8');
   await pool.query(sql);
+  await pool.query(SQL_DEPOSITO);
   console.log('Tabelas verificadas/criadas com sucesso.');
 }
 
@@ -195,6 +221,162 @@ app.post('/api/:store/lotes', requireApiKey, requireStore, async (req, res) => {
 app.delete('/api/:store/lotes/:id', requireApiKey, requireStore, async (req, res) => {
   await pool.query('DELETE FROM lotes WHERE store=$1 AND id=$2', [req.params.store, req.params.id]);
   res.json({ ok: true });
+});
+
+// --- Depósito Agromania ---------------------------------------------------------
+// Controle do que a loja (ex: Vila Valentim) guardou no depósito da Agromania.
+// Saldo = soma das entradas (levado ao depósito) - soma das saídas (voltou para a loja).
+
+const CATEGORIAS_DEPOSITO = ['Produto', 'Cesta', 'Embalagem', 'Outro'];
+
+function inteiroPositivo(v) {
+  const n = Number(v);
+  return Number.isInteger(n) && n > 0 ? n : null;
+}
+
+async function saldoItem(client, itemId) {
+  const { rows } = await client.query(
+    `SELECT COALESCE(SUM(CASE WHEN tipo='entrada' THEN quantidade ELSE -quantidade END),0)::int AS saldo
+     FROM deposito_movs WHERE item_id=$1`, [itemId]);
+  return rows[0].saldo;
+}
+
+// Lista os itens com saldo atual
+app.get('/api/:store/deposito', requireApiKey, requireStore, async (req, res) => {
+  const { rows } = await pool.query(
+    `SELECT i.id, i.codigo, i.descricao, i.categoria,
+            COALESCE(SUM(CASE WHEN m.tipo='entrada' THEN m.quantidade ELSE -m.quantidade END),0)::int AS saldo,
+            MAX(m.created_at) AS ultima_mov
+     FROM deposito_itens i
+     LEFT JOIN deposito_movs m ON m.item_id = i.id
+     WHERE i.store = $1
+     GROUP BY i.id
+     ORDER BY i.descricao`,
+    [req.params.store]
+  );
+  res.json(rows);
+});
+
+// Últimas movimentações (para o histórico)
+app.get('/api/:store/deposito/movs', requireApiKey, requireStore, async (req, res) => {
+  const limite = Math.min(Number(req.query.limit) || 100, 500);
+  const params = [req.params.store, limite];
+  let filtroItem = '';
+  if (req.query.item_id) { params.push(Number(req.query.item_id)); filtroItem = ' AND i.id = $3'; }
+  const { rows } = await pool.query(
+    `SELECT m.id, m.item_id, m.tipo, m.quantidade, m.usuario, m.obs, m.created_at,
+            i.descricao, i.categoria
+     FROM deposito_movs m JOIN deposito_itens i ON i.id = m.item_id
+     WHERE i.store = $1${filtroItem}
+     ORDER BY m.created_at DESC, m.id DESC
+     LIMIT $2`,
+    params
+  );
+  res.json(rows);
+});
+
+// Levar itens para o depósito (cria o item se ainda não existir)
+// Body: { item_id? , codigo?, descricao, categoria, quantidade, usuario, obs }
+app.post('/api/:store/deposito/entrada', requireApiKey, requireStore, async (req, res) => {
+  const store = req.params.store;
+  const quantidade = inteiroPositivo(req.body.quantidade);
+  const descricao = (req.body.descricao || '').toString().trim();
+  const categoria = CATEGORIAS_DEPOSITO.includes(req.body.categoria) ? req.body.categoria : 'Produto';
+  const codigo = (req.body.codigo || '').toString().trim() || null;
+  if (!quantidade) return res.status(400).json({ error: 'Informe uma quantidade inteira maior que zero.' });
+  if (!req.body.item_id && !descricao) return res.status(400).json({ error: 'Informe o item.' });
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    let itemId = Number(req.body.item_id) || null;
+    if (itemId) {
+      const { rowCount } = await client.query('SELECT 1 FROM deposito_itens WHERE id=$1 AND store=$2', [itemId, store]);
+      if (!rowCount) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Item não encontrado.' }); }
+    } else {
+      const existente = await client.query(
+        'SELECT id FROM deposito_itens WHERE store=$1 AND lower(descricao)=lower($2)', [store, descricao]);
+      if (existente.rowCount) {
+        itemId = existente.rows[0].id;
+      } else {
+        const novo = await client.query(
+          'INSERT INTO deposito_itens (store, codigo, descricao, categoria) VALUES ($1,$2,$3,$4) RETURNING id',
+          [store, codigo, descricao, categoria]);
+        itemId = novo.rows[0].id;
+      }
+    }
+    await client.query(
+      `INSERT INTO deposito_movs (item_id, tipo, quantidade, usuario, obs) VALUES ($1,'entrada',$2,$3,$4)`,
+      [itemId, quantidade, req.body.usuario || null, (req.body.obs || '').toString().trim() || null]);
+    const saldo = await saldoItem(client, itemId);
+    await client.query('COMMIT');
+    res.json({ ok: true, item_id: itemId, saldo });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error(err);
+    res.status(500).json({ error: 'Falha ao registrar a entrada no depósito.' });
+  } finally {
+    client.release();
+  }
+});
+
+// Dar baixa: itens que voltaram do depósito para a loja
+// Body: { quantidade, usuario, obs }
+app.post('/api/:store/deposito/:id/saida', requireApiKey, requireStore, async (req, res) => {
+  const store = req.params.store;
+  const itemId = Number(req.params.id);
+  const quantidade = inteiroPositivo(req.body.quantidade);
+  if (!quantidade) return res.status(400).json({ error: 'Informe uma quantidade inteira maior que zero.' });
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    // Trava o item para que duas baixas ao mesmo tempo não deixem o saldo negativo
+    const { rowCount } = await client.query('SELECT 1 FROM deposito_itens WHERE id=$1 AND store=$2 FOR UPDATE', [itemId, store]);
+    if (!rowCount) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Item não encontrado.' }); }
+    const saldoAtual = await saldoItem(client, itemId);
+    if (quantidade > saldoAtual) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: `Só há ${saldoAtual} no depósito para esse item.` });
+    }
+    await client.query(
+      `INSERT INTO deposito_movs (item_id, tipo, quantidade, usuario, obs) VALUES ($1,'saida',$2,$3,$4)`,
+      [itemId, quantidade, req.body.usuario || null, (req.body.obs || '').toString().trim() || null]);
+    await client.query('COMMIT');
+    res.json({ ok: true, saldo: saldoAtual - quantidade });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error(err);
+    res.status(500).json({ error: 'Falha ao dar baixa no depósito.' });
+  } finally {
+    client.release();
+  }
+});
+
+// Excluir um item (só quando o saldo estiver zerado — serve para corrigir cadastros errados)
+app.delete('/api/:store/deposito/:id', requireApiKey, requireStore, async (req, res) => {
+  const store = req.params.store;
+  const itemId = Number(req.params.id);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rowCount } = await client.query('SELECT 1 FROM deposito_itens WHERE id=$1 AND store=$2 FOR UPDATE', [itemId, store]);
+    if (!rowCount) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Item não encontrado.' }); }
+    const saldo = await saldoItem(client, itemId);
+    if (saldo !== 0) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'Só é possível excluir itens com saldo zero. Dê baixa antes.' });
+    }
+    await client.query('DELETE FROM deposito_itens WHERE id=$1', [itemId]);
+    await client.query('COMMIT');
+    res.json({ ok: true });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error(err);
+    res.status(500).json({ error: 'Falha ao excluir o item.' });
+  } finally {
+    client.release();
+  }
 });
 
 // --- Usuários da loja ----------------------------------------------------------
